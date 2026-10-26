@@ -53,6 +53,12 @@ disclosure with LayerTwo Labs.
   node). The wallet prefers a coin of another asset, then one of the quote asset, then one of the
   base asset, checks that the outputs fill and pay out exactly the coin and the auction's
   amounts, and refuses to send otherwise.
+* Wallet: an AMM swap that receives a BitAsset also spends one of the wallet's coins of it and pays it out with the
+  amount received (after the spent asset's change), and taking liquidity out spends one coin of each BitAsset of the
+  pool with the LP tokens and pays each back with its amount; under the consensus rules as reproduced, their builders'
+  swaps and burns cannot be filled or are refused (tests `wallet_amm_swap_with_a_coin_of_the_received_asset_is_valid`,
+  `wallet_amm_burn_with_a_coin_of_each_asset_is_valid`, and `appui_assets_pools_auctions_on_a_chain`, which connects
+  them with every check). Both builders check that the outputs fill and pay out exactly the coins plus the amounts.
 * Wallet: transactions the wallet builds are checked for fillability before they are sent
   (`check_fillable`).
 * Wallet: a reservation spends one coin, the correct control coin is selected, `amm_mint` sorts

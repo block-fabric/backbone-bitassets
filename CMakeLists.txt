@@ -19,6 +19,17 @@ add_subdirectory(core)
 
 add_subdirectory(chains/bitassets)
 
+# Our app of BitAssets (doc/app.md): bitassets-app, the node with our interface; and its pages as a pack for the unified
+# wallet (target bitassets-app-pack). Needs WebKitGTK (Linux) or WebView2 (Windows), npm, and the sidechain template's
+# repository (BT_KIT_DIR) at the commit of app/kit.commit.
+option(BT_BUILD_APP "Build bitassets-app" OFF)
+if(BT_BUILD_APP)
+  include(core/cmake/BtDesktopApp.cmake)
+  bt_desktop_app(bitassets-app STEM bitassets NAME BitAssets VERSION ${PROJECT_VERSION}
+                 CHAIN ${CMAKE_SOURCE_DIR}/app/chain MANIFEST ${CMAKE_SOURCE_DIR}/app/manifest.json
+                 KIT_COMMIT_FILE ${CMAKE_SOURCE_DIR}/app/kit.commit MAIN ${CMAKE_SOURCE_DIR}/chains/bitassets/app/main.cpp NODE_TARGET bitassets)
+endif()
+
 if(BT_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

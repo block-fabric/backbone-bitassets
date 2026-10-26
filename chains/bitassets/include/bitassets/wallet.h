@@ -66,8 +66,23 @@ public:
     Transaction reserve_bitasset(const std::string& plain_name);
     Transaction register_bitasset(const std::string& plain_name, const BitAssetData& data, uint64_t initial_supply);
     Transaction amm_mint(const AssetId& asset0, const AssetId& asset1, uint64_t amount0, uint64_t amount1, uint64_t lp_token_mint);
+    /** amm_burn: the LP tokens plus one of the wallet's coins of each BitAsset of the pool, paid back with the amounts
+     *  taken out (kept fix, wallet only: see build_amm_burn). */
     Transaction amm_burn(const AssetId& asset0, const AssetId& asset1, uint64_t amount0, uint64_t amount1, uint64_t lp_token_burn);
+    /** The burn builder without wallet state (also used by the tests): the LP tokens first, then for each BitAsset of the
+     *  pool one coin of it; outputs: the LP change, then asset0 (its coin plus amount0), asset1 (its coin plus amount1).
+     *  Throws WalletError when a coin is missing or the outputs would not fill or credit other than that. */
+    static Transaction build_amm_burn(const std::vector<std::pair<OutPoint, FilledOutput>>& lp_coins, const std::optional<std::pair<OutPoint, FilledOutput>>& coin0,
+                                      const std::optional<std::pair<OutPoint, FilledOutput>>& coin1, const AssetId& asset0, const AssetId& asset1, uint64_t amount0,
+                                      uint64_t amount1, uint64_t lp_token_burn, const std::array<Address, 3>& to);
+    /** amm_swap: a BitAsset received is paid out together with one of the wallet's coins of it (kept fix, wallet only:
+     *  see build_amm_swap). */
     Transaction amm_swap(const AssetId& spend, const AssetId& receive, uint64_t amount_spend, uint64_t amount_receive);
+    /** The swap builder without wallet state (also used by the tests): the coins of the spent asset first, then, for a
+     *  BitAsset received, one coin of it; outputs: the spent asset's change, the received asset (with that coin's
+     *  amount). Throws WalletError when the outputs would not fill or credit other than the coin plus the amount. */
+    static Transaction build_amm_swap(const std::vector<std::pair<OutPoint, FilledOutput>>& spend_coins, const std::optional<std::pair<OutPoint, FilledOutput>>& receive_coin,
+                                      const AssetId& spend, const AssetId& receive, uint64_t amount_spend, uint64_t amount_receive, const std::array<Address, 2>& to);
     Transaction dutch_auction_create(const DutchAuctionParams& p);
     Transaction dutch_auction_bid(const Hash32& auction_id, const AssetId& base, const AssetId& quote, uint64_t bid_size, uint64_t receive_quantity);
     /** dutch_auction_collect: the receipt plus one of the wallet's BitAsset coins, paid back in
@@ -88,6 +103,24 @@ public:
     Authorization sign_arbitrary_msg_as_addr(const Address& a, const std::string& msg);
     Bytes decrypt_msg(const bt::ByteArray<32>& epk, ByteSpan ciphertext);
     std::optional<std::string> plain_name(const Hash32& id);
+    /** The name, in words, a reservation of this wallet commits to (its commitment), or nothing. */
+    std::optional<std::string> reserved_name(const Hash32& commitment);
+    /** SHA-256(label 0x00 seed), or nothing without a seed: a public fingerprint of the seed (the app layer's), never the seed. */
+    std::optional<Hash32> seed_digest(std::string_view label);
+    /** Whether the wallet has a coin a reservation can spend (reserve_bitasset's policy input). */
+    bool has_spendable_coin();
+
+    /**
+     * While one lives, the builders of this thread make their transaction without taking new addresses (each output to
+     * a zero address, nothing written): the app layer's preview of a transaction it describes before asking (its coins,
+     * whether its outputs fill, its fee). Other threads are not affected. Never broadcast what a preview built.
+     */
+    struct PreviewScope {
+        PreviewScope();
+        ~PreviewScope();
+        PreviewScope(const PreviewScope&) = delete;
+        PreviewScope& operator=(const PreviewScope&) = delete;
+    };
 
     // key derivation (exposed for tests and differential checks)
     static bt::ByteArray<32> secret_bytes(const bt::ByteArray<64>& seed, uint32_t account, uint32_t index);

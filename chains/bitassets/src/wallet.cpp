@@ -15,6 +15,8 @@
 #include <array>
 #include <cstring>
 
+#include <sodium.h>
+
 namespace bitassets {
 
 using bt::kv::Txn;
@@ -25,6 +27,11 @@ enum : uint8_t {
 };
 
 Wallet::Wallet(const std::string& path, Node& node) : store_(bt::kv::open_sqlite(path)), node_(node) {}
+
+// The app layer's previews (PreviewScope): this thread's builders take no new address while one lives.
+static thread_local int g_preview_depth = 0;
+Wallet::PreviewScope::PreviewScope() { ++g_preview_depth; }
+Wallet::PreviewScope::~PreviewScope() { --g_preview_depth; }
 
 // ------------------------------------------------------------------ keys (wallet.rs:285-387)
 bt::ByteArray<32> Wallet::secret_bytes(const bt::ByteArray<64>& seed, uint32_t account, uint32_t index)
@@ -62,6 +69,17 @@ std::optional<bt::ByteArray<64>> Wallet::seed()
     auto v = t.get(W_SEED, Bytes{0});
     if (!v || v->size() != 64) return std::nullopt;
     return bt::ByteArray<64>::from_span(*v);
+}
+
+std::optional<Hash32> Wallet::seed_digest(std::string_view label)
+{
+    std::lock_guard<std::mutex> l(mu_);
+    auto s = seed();
+    if (!s) return std::nullopt;
+    const uint8_t zero = 0;
+    Hash32 h = bt::sha256_parts({ByteSpan(reinterpret_cast<const uint8_t*>(label.data()), label.size()), ByteSpan(&zero, 1), s->span()});
+    sodium_memzero(s->data(), s->size());
+    return h;
 }
 
 bt::ByteArray<64> Wallet::need_seed()
@@ -122,6 +140,7 @@ static uint32_t next_index(const Txn& t, uint8_t table)
 
 Address Wallet::get_new_address()
 {
+    if (g_preview_depth > 0) return Address{}; // a preview: no address taken, nothing written
     std::lock_guard<std::mutex> l(mu_);
     auto s = need_seed();
     Txn t(*store_);
@@ -214,6 +233,24 @@ void Wallet::remember_name(const Hash32& id, const std::string& plain)
     Txn t(*store_);
     t.put(W_KNOWN_NAMES, id.span(), ByteSpan((const uint8_t*)plain.data(), plain.size()));
     t.commit();
+}
+
+std::optional<std::string> Wallet::reserved_name(const Hash32& commitment)
+{
+    Txn t(*store_);
+    auto v = t.get(W_RESERVATIONS, commitment.span());
+    if (!v) return std::nullopt;
+    return std::string(v->begin(), v->end());
+}
+
+bool Wallet::has_spendable_coin()
+{
+    try {
+        select_coins(1);
+        return true;
+    } catch (const WalletError&) {
+        return false;
+    }
 }
 
 std::optional<std::string> Wallet::plain_name(const Hash32& id)
@@ -513,46 +550,168 @@ Transaction Wallet::amm_mint(const AssetId& asset0, const AssetId& asset1, uint6
     return tx;
 }
 
-// amm_burn (wallet.rs:1160-1227)
+// amm_burn (wallet.rs:1160-1227).
+// Kept fix (wallet only; consensus unchanged): under the consensus rules as reproduced, a burn is valid only when it also
+// spends coins of two BitAssets; theirs spends the LP tokens alone, which their node and ours reject. Ours spends one
+// coin of each BitAsset of the pool and pays it back with the amount taken out (as the Dutch-auction collect), test
+// wallet_amm_burn_with_a_coin_of_each_asset_is_valid.
 Transaction Wallet::amm_burn(const AssetId& asset0, const AssetId& asset1, uint64_t amount0, uint64_t amount1, uint64_t lp_token_burn)
 {
-    Address a0 = get_new_address(), a1 = get_new_address();
+    std::array<Address, 3> to{get_new_address(), get_new_address(), get_new_address()};
     auto [in_lp, lp_ops] = select_lp_tokens(asset0, asset1, lp_token_burn);
+    (void)in_lp;
+    auto mine = utxos(); // leaves out coins spent by mempool transactions
+    std::vector<std::pair<OutPoint, FilledOutput>> lp_coins;
+    for (auto& op : lp_ops) {
+        auto it = std::find_if(mine.begin(), mine.end(), [&](auto& p) { return p.first == op; });
+        if (it == mine.end()) throw WalletError("no utxo");
+        lp_coins.push_back(*it);
+    }
+    auto smallest = [&](const AssetId& a) {
+        std::optional<std::pair<OutPoint, FilledOutput>> r;
+        if (a.kind != AssetId::BitAsset) return r;
+        for (auto& e : mine) {
+            if (!e.second.content.is_bitasset() || e.second.content.id != a.id) continue;
+            if (!r || e.second.content.value < r->second.content.value) r = e;
+        }
+        return r;
+    };
+    return build_amm_burn(lp_coins, smallest(asset0), smallest(asset1), asset0, asset1, amount0, amount1, lp_token_burn, to);
+}
+
+Transaction Wallet::build_amm_burn(const std::vector<std::pair<OutPoint, FilledOutput>>& lp_coins, const std::optional<std::pair<OutPoint, FilledOutput>>& coin0,
+                                   const std::optional<std::pair<OutPoint, FilledOutput>>& coin1, const AssetId& asset0, const AssetId& asset1, uint64_t amount0,
+                                   uint64_t amount1, uint64_t lp_token_burn, const std::array<Address, 3>& to)
+{
+    if (asset0.kind != AssetId::BitAsset || asset1.kind != AssetId::BitAsset)
+        throw WalletError("this wallet takes liquidity out of pools of two BitAssets only (the chain's rules need a coin of each spent with it)");
+    if (!coin0 || !coin1)
+        throw WalletError("taking liquidity out of this pool spends one coin of each of its two assets with the LP tokens: this wallet has none of " +
+                          (coin0 ? asset1 : asset0).to_hex());
+    uint64_t in_lp = 0;
     Transaction tx;
-    tx.inputs = lp_ops;
+    std::vector<FilledOutput> spent;
+    for (auto& [op, o] : lp_coins) {
+        if (in_lp + o.content.value < in_lp) throw WalletError("LP token amount overflow");
+        in_lp += o.content.value;
+        tx.inputs.push_back(op);
+        spent.push_back(o);
+    }
+    if (in_lp < lp_token_burn) throw WalletError("not enough funds");
+    tx.inputs.push_back(coin0->first);
+    spent.push_back(coin0->second);
+    tx.inputs.push_back(coin1->first);
+    spent.push_back(coin1->second);
+    const uint64_t out0 = coin0->second.content.value + amount0, out1 = coin1->second.content.value + amount1;
+    if (out0 < amount0 || out1 < amount1) throw WalletError("amount overflow");
     if (in_lp - lp_token_burn != 0) {
         Output c;
-        c.address = get_new_address();
+        c.address = to[0];
         c.content.kind = Content::AmmLpToken;
         c.content.value = in_lp - lp_token_burn;
         tx.outputs.push_back(c);
     }
-    tx.outputs.push_back(asset_output(a0, asset0, amount0));
-    tx.outputs.push_back(asset_output(a1, asset1, amount1));
+    tx.outputs.push_back(asset_output(to[1], asset0, out0));
+    tx.outputs.push_back(asset_output(to[2], asset1, out1));
     TxData d;
     d.kind = TxData::AmmBurn;
     d.amount0 = amount0;
     d.amount1 = amount1;
     d.lp_tokens = lp_token_burn;
     tx.data = d;
+    // self-check: the outputs fill and pay out exactly the two coins plus the amounts (and the LP change)
+    FilledTransaction ft{&tx, spent};
+    auto filled = ft.filled_outputs();
+    if (!filled || !ft.bitcoin_fee()) throw WalletError("this burn cannot be paid out under the current consensus rules; not sent");
+    std::map<AssetId, uint64_t> want, got;
+    want[asset0] += out0;
+    want[asset1] += out1;
+    uint64_t lp_out = 0;
+    for (auto& f : *filled) {
+        if (f.content.is_lp_token()) {
+            lp_out += f.content.value;
+            continue;
+        }
+        auto av = f.content.asset_value();
+        if (!av) throw WalletError("this burn cannot be paid out under the current consensus rules; not sent");
+        got[av->first] += av->second;
+    }
+    if (want != got || lp_out != in_lp - lp_token_burn) throw WalletError("this burn cannot be paid out under the current consensus rules; not sent");
     return tx;
 }
 
-// amm_swap (wallet.rs:1230-1287): the first unique spent asset must be the spent one
+// amm_swap (wallet.rs:1230-1287): the first unique spent asset must be the spent one.
+// Kept fix (wallet only; consensus unchanged): a BitAsset received from a pool is paid out in one output together with
+// one of the wallet's coins of it, spent after the spent asset's coins (so that asset stays the first one), as the
+// Dutch-auction collect does. Their builder pays the received amount alone, which the outputs never fill: the swap
+// cannot be sent (test wallet_amm_swap_with_a_coin_of_the_received_asset_is_valid).
 Transaction Wallet::amm_swap(const AssetId& spend, const AssetId& receive, uint64_t amount_spend, uint64_t amount_receive)
 {
-    Address raddr = get_new_address();
+    std::array<Address, 2> to{get_new_address(), get_new_address()};
     auto [in, ops] = select_asset(spend, amount_spend);
+    (void)in;
+    auto mine = utxos(); // leaves out coins spent by mempool transactions
+    std::vector<std::pair<OutPoint, FilledOutput>> coins;
+    for (auto& op : ops) {
+        auto it = std::find_if(mine.begin(), mine.end(), [&](auto& p) { return p.first == op; });
+        if (it == mine.end()) throw WalletError("no utxo");
+        coins.push_back(*it);
+    }
+    std::optional<std::pair<OutPoint, FilledOutput>> receive_coin;
+    if (receive.kind == AssetId::BitAsset) {
+        for (auto& e : mine) {
+            if (!e.second.content.is_bitasset() || e.second.content.id != receive.id) continue;
+            if (!receive_coin || e.second.content.value < receive_coin->second.content.value) receive_coin = e;
+        }
+    }
+    return build_amm_swap(coins, receive_coin, spend, receive, amount_spend, amount_receive, to);
+}
+
+Transaction Wallet::build_amm_swap(const std::vector<std::pair<OutPoint, FilledOutput>>& spend_coins, const std::optional<std::pair<OutPoint, FilledOutput>>& receive_coin,
+                                   const AssetId& spend, const AssetId& receive, uint64_t amount_spend, uint64_t amount_receive, const std::array<Address, 2>& to)
+{
+    auto value_of = [](const FilledOutput& o) -> uint64_t { return o.content.is_bitcoin() ? o.bitcoin_value() : o.content.value; };
+    uint64_t in = 0;
     Transaction tx;
-    tx.inputs = ops;
-    if (in - amount_spend != 0) tx.outputs.push_back(asset_output(get_new_address(), spend, in - amount_spend));
-    tx.outputs.push_back(asset_output(raddr, receive, amount_receive));
+    std::vector<FilledOutput> spent;
+    for (auto& [op, o] : spend_coins) {
+        if (in + value_of(o) < in) throw WalletError("amount overflow");
+        in += value_of(o);
+        tx.inputs.push_back(op);
+        spent.push_back(o);
+    }
+    if (in < amount_spend) throw WalletError("not enough funds");
+    if (in - amount_spend != 0) tx.outputs.push_back(asset_output(to[0], spend, in - amount_spend));
+    uint64_t out_receive = amount_receive;
+    if (receive.kind == AssetId::BitAsset) {
+        if (!receive_coin) throw WalletError("a BitAsset received from a pool is paid out with a coin of it: this wallet has none of " + receive.to_hex());
+        out_receive = receive_coin->second.content.value + amount_receive;
+        if (out_receive < amount_receive) throw WalletError("amount overflow");
+        tx.inputs.push_back(receive_coin->first);
+        spent.push_back(receive_coin->second);
+    }
+    tx.outputs.push_back(asset_output(to[1], receive, out_receive));
     TxData d;
     d.kind = TxData::AmmSwap;
     d.amount_spent = amount_spend;
     d.amount_receive = amount_receive;
     d.pair_asset = receive;
     tx.data = d;
+    // self-check: the outputs fill, the fee is defined, and they pay out exactly the change and the coin plus the amount
+    FilledTransaction ft{&tx, spent};
+    auto filled = ft.filled_outputs();
+    if (!filled || !ft.bitcoin_fee()) throw WalletError("this swap cannot be paid out under the current consensus rules; not sent");
+    std::map<AssetId, uint64_t> want, got;
+    want[spend] += in - amount_spend;
+    want[receive] += out_receive;
+    for (auto& f : *filled) {
+        auto av = f.content.asset_value();
+        if (!av) throw WalletError("this swap cannot be paid out under the current consensus rules; not sent");
+        got[av->first] += av->second;
+    }
+    std::erase_if(want, [](auto& e) { return e.second == 0; });
+    std::erase_if(got, [](auto& e) { return e.second == 0; });
+    if (want != got) throw WalletError("this swap cannot be paid out under the current consensus rules; not sent");
     return tx;
 }
 

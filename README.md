@@ -33,6 +33,19 @@ cmake --build build -j4
 build/tests/bt_tests
 ```
 
+## The app (bitassets-app)
+
+Our sidechain app on this node: the sidechain template's window, trusted dialog and interface kit, with pages for
+this chain's data model (assets, pools, auctions); the node runs as the app's child, unchanged (consensus and the
+LayerTwo RPC byte for byte), the app talking to its separate, authenticated app RPC. The same pages are a pack for the
+unified wallet. See `doc/app.md` and `core/doc/app.md`.
+
+```
+cmake -S . -B build-app -DBT_BUILD_APP=ON -DBT_KIT_DIR=<sidechain-template repo>   # GTK 3, WebKitGTK 4.1, npm
+~/skydoge/tools/build.sh ~/skydoge/backbone-bitassets build-app
+build-app/chains/bitassets/bitassets-app
+```
+
 ## Run on betanet
 
 ```

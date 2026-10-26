@@ -8,4 +8,8 @@ add_test(NAME bt_tests COMMAND bt_tests)
 if(BT_WITH_NET)
   target_sources(bt_tests PRIVATE test_bitassets_node.cpp)
   target_link_libraries(bt_tests PRIVATE bitassets_node bt_net)
+  # The app layer (doc/app.md): the LayerTwo RPC the same with it, its reads, the phrase's flows, the spends described on
+  # a chain built here, the manifest.
+  target_sources(bt_tests PRIVATE test_bitassets_appui.cpp)
+  target_compile_definitions(bt_tests PRIVATE BT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 endif()
